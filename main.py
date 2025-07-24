@@ -1,160 +1,333 @@
-# main.py
-
-import sys
-import pathlib
-
-from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
-from utils.llm_configs import llm_config
-
-# Engineer agent
-engineer = AssistantAgent(
-    name="Engineer",
-    llm_config=llm_config,
-    system_message="""
-    I am an experienced software engineering agent dedicated exclusively to writing code as specified by the Project Manager.
-    My focus is on clean execution — I do not manage tasks or influence project direction.
-
-    Role: Software Engineer (Execution-Focused)
-
-    What I Do:
-    - I implement features and bug fixes based on well-defined task specifications.
-    - I write code that adheres to best practices: clean, efficient, maintainable, and optimized for performance.
-    - I document my code clearly to support future development and team collaboration.
-
-    What I Don’t Do:
-    - I never assign or prioritize tasks — I wait for clear instructions.
-    - I don’t decide on project scope, architecture, or timelines.
-    - I don’t review or merge code unless explicitly asked.
-
-    My Mission:
-    To deliver production-ready code that meets functional and technical requirements set by the Project Manager and Admin — nothing more, nothing less.
-    """,
-)
-
-# Project Manager agent
-project_manager = AssistantAgent(
-    name="Project_Manager",
-    llm_config=llm_config,
-    system_message="""
-   I am a project management agent responsible for driving the successful development of a software product.
-    I translate high-level requirements from the Admin into clear, actionable tasks and assign them to the Engineer for execution.
-
-    Role: Project Manager (Task-Oriented Oversight)
-
-    What I Do:
-    - I decompose project requirements into structured, manageable tasks.
-    - I assign tasks to the Engineer in a logical and efficient order.
-    - I track task progression and ensure timely delivery of each milestone.
-
-    Workflow:
-    - Upon task completion, I evaluate whether additional tasks are needed.
-    - I ensure any blockers or issues are resolved before proceeding.
-    - Once all tasks are completed and verified, I conclude the project with a "DONE" status.
-
-    What I Don’t Do:
-    - I do not write, review, or test code.
-    - I stay out of technical implementation — my focus is solely on coordination and delivery.
-
-    My Mission:
-    To maintain smooth project execution through structured task management and clear communication with both the Admin and Engineer.
-    I ensure that the project stays on track and meets its objectives without getting involved in the technical details.
-    """,
-)
-
-# Admin agent
-user_proxy = UserProxyAgent(
-    name="Admin",
-    human_input_mode="ALWAYS",
-    code_execution_config=False,
-)
-
-# Setup the group chat
-group_chat = GroupChat(
-    agents=[user_proxy, project_manager, engineer],
-    messages=[],
-    max_round=100,
-    send_introductions=True,
-    enable_clear_history=True,
-)
-
-chat_manager = GroupChatManager(
-    groupchat=group_chat,
-    llm_config=llm_config,
-    is_termination_msg=lambda msg: msg["role"] == "assistant" and msg["name"] == "Project_Manager" and msg["content"].strip().lower() == "done",
-)
-
-# Tool registration for Engineer and Admin agents
+import autogen
 import os
-from typing_extensions import Annotated, List, Tuple
+import time
+import re
+from utils.llm_configs import llm_config
+import requests
+from bs4 import BeautifulSoup
 
-default_path = os.path.abspath("./output") + "/"
-# Ensure the output directory exists
-os.makedirs(default_path, exist_ok=True)
+# --------- Recherche Web & Scraping ---------
+def google_search(query, api_key, num_results=5):
+    url = "https://google.serper.dev/search"
+    payload = {"q": query, "num": num_results}
+    headers = {"X-API-KEY": api_key}
+    response = requests.post(url, json=payload, headers=headers)
+    data = response.json()
+    return [item['link'] for item in data.get('organic', [])[:num_results]]
 
-@user_proxy.register_for_execution()
-@engineer.register_for_llm(description="List files in chosen directory.")
-def list_dir(
-    directory: Annotated[str, "Directory to check."]
-) -> Annotated[Tuple[int, List[str]], "Status code and list of files"]:
-    files = os.listdir(default_path + directory)
-    return 0, files
+def extract_text_from_url(url, max_length=1000):
+    try:
+        r = requests.get(url, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        })
+        r.encoding = "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+        ps = soup.find_all("p")
+        text = "\n".join([p.get_text(strip=True) for p in ps])
+        text = ' '.join(text.split())
+        if not text or len(text) < 200:
+            return None
+        return text[:max_length]
+    except Exception:
+        return None
 
-@user_proxy.register_for_execution()
-@engineer.register_for_llm(description="Check the contents of a chosen file.")
-def see_file(
-    filename: Annotated[str, "Name and path of file to check."]
-) -> Annotated[Tuple[int, str], "Status code and file contents."]:
-    with open(default_path + filename, "r") as file:
-        lines = file.readlines()
-    formatted_lines = [f"{i+1}:{line}" for i, line in enumerate(lines)]
-    file_contents = "".join(formatted_lines)
-    return 0, file_contents
+def collect_external_knowledge(query, api_key, max_sources=5):
+    links = google_search(query, api_key, num_results=max_sources)
+    all_texts = []
+    for idx, link in enumerate(links, 1):
+        content = extract_text_from_url(link)
+        if content:
+            all_texts.append(f"Source {idx}: {link}\n{content}")
+    return all_texts
 
-@user_proxy.register_for_execution()
-@engineer.register_for_llm(description="Replaces all the code within a file with new one. Proper indentation is important.")
-def modify_code(
-    filename: Annotated[str, "Name and path of file to change."],
-    new_code: Annotated[str, "New piece of code to replace old code with. Remember about providing indents."],
-) -> Annotated[Tuple[int, str], "Status code and message."]:
-    with open(default_path + filename, "w") as file:
-        file.write(new_code)
-    return 0, "Code was written successfully."
+# --------- Agents Setup ---------
+writer = autogen.AssistantAgent(
+    name="Writer",
+    llm_config=llm_config,
+    system_message=(
+        "Vous êtes rédacteur expert en pharmacie, chargé de rédiger un article destiné aux pharmaciens français ayant une approche entrepreneuriale et souhaitant développer la croissance de leur officine. "
+        "Ils maîtrisent leur métier et attendent un contenu pointu, pragmatique et orienté business. "
+        "Fournissez un brouillon structuré, riche en conseils pratiques et en données utiles pour soutenir leur stratégie de croissance. "
+        "Si vous recevez un texte provenant du Researcher, intégrez-le explicitement et reformulez-le pour enrichir l’article."
+    ),
+)
 
-@user_proxy.register_for_execution()
-@engineer.register_for_llm(description="Create a new file with code.")
-def create_file_with_code(
-    filename: Annotated[str, "Name and path of file to create."], 
-    code: Annotated[str, "Code to write in the file."]
-) -> Annotated[Tuple[int, str], "Status code and message."]:
-    with open(default_path + filename, "w") as file:
-        file.write(code)
-    return 0, "File created successfully"
+content_director = autogen.AssistantAgent(
+    name="ContentDirector",
+    llm_config=llm_config,
+    system_message=(
+        "Vous êtes Content Director, expert en stratégie de croissance et chef d’orchestre éditorial. "
+        "Vous évaluez le brouillon du rédacteur avec un regard critique entrepreneurial : vérifiez la pertinence des conseils business, la faisabilité opérationnelle et l’impact sur la croissance de l’officine. "
+        "Proposez des améliorations pour renforcer l’approche entrepreneuriale, la clarté et l’efficacité des recommandations. "
+        "Répondez toujours par un feedback précis sans réécrire le texte et terminez par UN SEUL tag sur une ligne (#validé, #neededresearch, #noneededresearch)."
+    ),
+)
 
-@user_proxy.register_for_execution()
-@engineer.register_for_llm(description="Execute bash command.")
-def execute_command(
-    command: Annotated[str, "Command to execute."]
-) -> Annotated[Tuple[int, str], "Status code and message."]:
-    os.system(f"CI=true cd {default_path} && {command}")
-    return 0, "Command executed successfully"
+reviewer = autogen.AssistantAgent(
+    name="Reviewer",
+    llm_config=llm_config,
+    system_message=(
+        "Vous êtes relecteur SEO. Votre mission : rendre l’article final optimisé pour le référencement Google, lisible et pertinent pour des pharmaciens en France. "
+        "Vous ne touchez qu’à la structure et aux formulations pour améliorer l’impact SEO, sans changer le fond."
+    ),
+)
 
-# Runtime prompt for the initial task
-if __name__ == "__main__":
-    print("👋 Welcome, Admin!")
+researcher = autogen.AssistantAgent(
+    name="Researcher",
+    llm_config=llm_config,
+    system_message=(
+        "Vous êtes chercheur. Lors d’un feedback #neededresearch, répondez STRICTEMENT et EXCLUSIVEMENT à la section 'Ce qui doit être cherché' fournie par le Content Director. \n"
+        "Ne traitez aucun autre point, même s’il est mentionné ailleurs dans le message. Présentez un résumé synthétique pour chaque point, accompagné d’au moins une source web fiable par point, en français."
+    ),
+)
 
-if len(sys.argv) == 2:
-    requirements_path = pathlib.Path(sys.argv[1])
-    if not requirements_path.is_file():
-        print(f"❌ The file '{requirements_path}' does not exist.")
-        sys.exit(1)
+# --------- Helper Functions ---------
+def get_tag(content):
+    lines = content.strip().split('\n')
+    for line in lines:
+        tag = line.strip().lower()
+        if tag.startswith('#validé') or tag.startswith('#neededresearch') or tag.startswith('#noneededresearch'):
+            return tag
+    return None
 
-    with open(requirements_path, 'r') as file:
-        initial_message = file.read().strip()
-    print("📄 Loaded requirements file. Starting the conversation...")
-else:
-    initial_message = input("📝 What task should the team work on?\n> ")
+def log_step(step, message):
+    print(f"\n=== {step.upper()} ===\n{message[:250]}\n---")
 
-    user_proxy.initiate_chat(
-        chat_manager,
-        message=initial_message,
+def summarize_knowledge(sources):
+    if not sources:
+        return "Aucun résultat Google pertinent trouvé."
+    joined = "\n\n".join(s[:800] for s in sources)
+    prompt = (
+        "Voici des extraits issus des 5 premiers résultats Google concernant le sujet de l'article.\n"
+        "Fais un résumé structuré et synthétique (max 8 lignes) de ces informations pour alimenter l'article.\n\n"
+        + joined
     )
+    try:
+        summary = writer.generate_reply(messages=[{"role": "user", "content": prompt}])
+        return summary if summary else "Résumé non généré."
+    except Exception as e:
+        return f"Erreur résumé automatique : {e}"
+
+from autogen import GroupChatManager
+
+class StrictWorkflowManager(GroupChatManager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.next_agent = None
+        self.validated = False
+
+    def on_message(self, last_message, groupchat):
+        """
+        Orchestration stricte des rôles pour garantir la séquence éditoriale :
+        - Writer → ContentDirector
+        - ContentDirector → (Researcher si #neededresearch, Reviewer sinon)
+        - Researcher → Writer
+        - Reviewer → None (fin)
+        """
+        role = last_message["role"].lower()
+        content = last_message["content"]
+        tag = get_tag(content) if role == "contentdirector" else None
+
+        if role == "writer":
+            # Toujours passer au ContentDirector après Writer
+            return content_director
+
+        elif role == "contentdirector":
+            if tag:
+                if tag.startswith('#neededresearch'):
+                    # Besoin de recherche : passe au Researcher
+                    return researcher
+                elif tag.startswith('#noneededresearch'):
+                    # Pas de recherche, mais à retravailler : retour au Writer
+                    return writer
+                elif tag.startswith('#validé'):
+                    # Article validé : passe au Reviewer pour relecture finale
+                    return reviewer
+                else:
+                    raise Exception(f"Tag inconnu du ContentDirector : {tag}\nRéponse : {content}")
+            else:
+                # Aucun tag fourni : on retourne au Writer par défaut
+                print("Aucun tag trouvé dans la réponse du ContentDirector. Retour au Writer.")
+                return writer
+
+        elif role == "researcher":
+            # Recherche terminée : retour au Writer qui doit intégrer la recherche
+            return writer
+
+        elif role == "reviewer":
+            # Fin du process
+            return None
+
+        else:
+            raise Exception(f"Rôle d'agent inattendu : {role}")
+
+# --------- MAIN PROCESS ---------
+def main():
+    topic = input("Quel est le sujet de l'article ? ")
+    topic_filename = re.sub(r'[^a-zA-Z0-9_]', '', topic.replace(' ', '_'))
+
+    SERPER_API_KEY = "a4a8a9ef99d85c4102363380cfd7d39a0447ac68"
+    external_knowledge = collect_external_knowledge(topic, SERPER_API_KEY)
+    summary_snippet = summarize_knowledge(external_knowledge)
+
+    guidelines = f"""Voici les guidelines pour un article sur : {topic}
+
+Résumé des informations issues du web :
+{summary_snippet}
+"""
+
+    if external_knowledge:
+        context_snippet = "\n\n---\nVoici des informations issues des 5 premiers résultats Google :\n"
+        for source in external_knowledge:
+            context_snippet += "\n" + source[:1000] + "\n..."
+        guidelines += context_snippet
+    else:
+        guidelines += "\n\n---\nAucune information externe n’a pu être récupérée.\n"
+
+    from autogen import GroupChat
+
+    agents = [
+        writer,
+        content_director,
+        researcher,
+        reviewer,
+    ]
+    groupchat = GroupChat(
+        agents=agents,
+        messages=[],
+        max_round=30,
+    )
+    manager = StrictWorkflowManager(
+        groupchat=groupchat,
+        llm_config=llm_config,
+    )
+
+    # On démarre sur le Writer
+    last_agent = writer
+    last_content = guidelines
+    conversation = []
+
+    # Garde la trace du dernier rôle d'agent pour éviter les auto-boucles
+    last_role = None  # Garde la trace du dernier rôle d'agent pour éviter les auto-boucles
+
+    # Boucle principale : gère la passation stricte entre rôles, empêche toute auto-boucle agent-agent
+    for _ in range(30):
+        # Stop further processing if the Reviewer has already responded
+        if last_agent.name.lower() == "reviewer":
+            break
+        loop_detected = False
+        current_len = len(groupchat.messages)
+        manager.initiate_chat(recipient=last_agent, message=last_content)
+        # Wait for a NEW message to be added
+        while True:
+            if len(groupchat.messages) > current_len:
+                break
+            time.sleep(0.2)
+
+        # Cherche le dernier message d'un agent "valide" ET différent du rôle précédent
+        agent_roles = {"writer", "contentdirector", "reviewer", "researcher"}
+        last_message_idx = -1
+        force_researcher = False
+        force_writer = False
+        force_contentdirector = False
+        while last_message_idx >= -len(groupchat.messages):
+            candidate = groupchat.messages[last_message_idx]
+            if candidate['role'].lower() in agent_roles:
+                # Ignore si même rôle que le précédent (anti-boucle stricte)
+                if last_role is not None and candidate['role'].lower() == last_role:
+                    # Si ContentDirector répond 2 fois d'affilée avec #neededresearch, on force le passage au Researcher
+                    if candidate['role'].lower() == "contentdirector":
+                        tag = get_tag(candidate['content'])
+                        if tag and tag.startswith("#neededresearch"):
+                            last_message = candidate
+                            last_agent = researcher
+                            force_researcher = True
+                            print("Forçage anti-boucle : ContentDirector ne peut pas répondre 2 fois d'affilée à #neededresearch. Passage forcé au Researcher.")
+                            break
+                    # Si Researcher répond 2 fois d'affilée, on force le passage au Writer
+                    if candidate['role'].lower() == "researcher":
+                        last_message = candidate
+                        last_agent = writer
+                        force_writer = True
+                        print("Forçage anti-boucle : Researcher ne peut pas répondre 2 fois d'affilée. Passage forcé au Writer.")
+                        break
+                    # Si Writer répond 2 fois d'affilée, on force le passage au ContentDirector
+                    if candidate['role'].lower() == "writer":
+                        last_message = candidate
+                        last_agent = content_director
+                        force_contentdirector = True
+                        print("Forçage anti-boucle : Writer ne peut pas répondre 2 fois d'affilée. Passage forcé au ContentDirector.")
+                        break
+                    print(f"Boucle détectée : {candidate['role']} vient de répondre deux fois de suite. Arrêt pour éviter une boucle infinie.")
+                    final_article = candidate['content']
+                    loop_detected = True
+                    break
+                last_message = candidate
+                break
+            last_message_idx -= 1
+        else:
+            print("Aucun message d'agent trouvé dans la pile des messages ! Arrêt du workflow.")
+            final_article = last_content
+            break
+
+        # If a loop was detected, exit the main workflow loop
+        if loop_detected:
+            print("Boucle détectée. Fin du processus éditorial.")
+            break
+
+        role = last_message['role'].lower()
+        content = last_message['content']
+
+        # Detect empty agent responses to avoid infinite loops
+        if not content.strip():
+            print(f"Agent {role} a renvoyé un contenu vide. Arrêt du workflow pour éviter une boucle infinie.")
+            break
+
+        conversation.append({"role": role, "content": content})
+        log_step(role, content)
+        last_content = content
+
+        # Si le rôle est reviewer, on arrête immédiatement le process
+        if role == "reviewer":
+            final_article = content
+            # FORÇAGE : Stoppe immédiatement le workflow après le reviewer (aucun nouvel agent ne doit intervenir)
+            # Blocage strict : s'assurer qu'aucun agent n'est appelé après la review finale
+            break
+
+        # Si forçage, next_agent déjà fixé
+        if force_researcher and role == "contentdirector":
+            next_agent = researcher
+        elif force_writer and role == "researcher":
+            next_agent = writer
+        elif force_contentdirector and role == "writer":
+            next_agent = content_director
+        else:
+            next_agent = manager.on_message(last_message, groupchat)
+        if next_agent is None:
+            final_article = content
+            break
+        # Anti-boucle : si le prochain agent est le même que l’actuel, on stoppe proprement
+        if next_agent.name.lower() == role:
+            print(f"Le prochain agent ({next_agent.name}) est identique à celui qui vient de répondre ({role}). Fin de la boucle pour éviter une boucle infinie.")
+            final_article = content
+            break
+        last_agent = next_agent
+        last_role = role  # Mémorise ce rôle pour la prochaine boucle
+
+    # Workflow stoppé dès la réponse du Reviewer, aucun passage supplémentaire, pour garantir la terminaison stricte du process éditorial.
+
+    os.makedirs("output", exist_ok=True)
+    output_path = f"output/{topic_filename}.md"
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(final_article)
+    print(f"\nArticle sauvegardé dans {output_path}")
+
+    print("\n==== CONVERSATION ====")
+    for m in conversation:
+        short = m['content'][:150].replace('\n',' ') + ("..." if len(m['content']) > 150 else "")
+        print(f">> {m['role']} : {short}")
+    # Signal explicit termination after reviewer
+    print("TERMINATE")
+
+if __name__ == "__main__":
+    main()
